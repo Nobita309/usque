@@ -1,0 +1,58 @@
+name: Sync & Build Docker Image
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add or update upstream remote
+        run: |
+          git remote | grep upstream && \
+            git remote set-url upstream https://github.com/Diniboy1123/Usque.git || \
+            git remote add upstream https://github.com/Diniboy1123/Usque.git
+          git fetch upstream
+
+      - name: Checkout main
+        run: git checkout main
+
+      - name: Merge upstream/main
+        run: |
+          git merge upstream/main --no-edit || echo "Merge conflict or nothing to merge"
+
+      - name: Push changes to main
+        run: |
+          git push origin main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/usque:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/usque:${{ github.sha }}
+
+      - name: Output image info
+        run: |
+          echo "Image đã được push: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/usque:latest"
+          echo "Versioned tag: ${{ github.sha }}"

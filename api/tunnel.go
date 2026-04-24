@@ -143,6 +143,12 @@ func NewWaterAdapter(iface *water.Interface) TunnelDevice {
 	return &WaterAdapter{iface: iface}
 }
 
+// pumpShutdownGrace bounds how long the supervisor waits for both forwarding
+// pumps to exit after an error before spawning a fresh pair. A device-side
+// pump may still be parked in a blocking TUN read during this window; the
+// readMu serializes any overlap with the next cycle's device reader.
+const pumpShutdownGrace = 2 * time.Second
+
 // MaintainTunnelConfig contains runtime settings for tunnel maintenance.
 type MaintainTunnelConfig struct {
 	TLSConfig         *tls.Config
@@ -154,6 +160,45 @@ type MaintainTunnelConfig struct {
 	ReconnectDelay    time.Duration
 	AlwaysReconnect   bool
 	UseHTTP2          bool
+	// OnConnect is a path to an executable run after every successful tunnel
+	// connect. It is exec'd directly (no shell, no args) and runs fire-and-forget.
+	OnConnect string
+	// OnDisconnect is a path to an executable run after every tunnel loss.
+	// It is exec'd directly (no shell, no args) and runs fire-and-forget.
+	OnDisconnect string
+	// HookEnv is a set of USQUE_* environment variables layered on top of the
+	// parent process env for OnConnect / OnDisconnect invocations. USQUE_EVENT
+	// and USQUE_ENDPOINT are set by MaintainTunnel itself.
+	HookEnv map[string]string
+}
+
+// cloneHookEnv returns a shallow copy of src so concurrent hook invocations
+// do not share a map.
+func cloneHookEnv(src map[string]string) map[string]string {
+	out := make(map[string]string, len(src)+2)
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+// sleepCtx sleeps for d or until ctx is cancelled, whichever comes first.
+// Returns ctx.Err() on cancellation and nil on normal completion.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // MaintainTunnel continuously connects to the MASQUE server, then starts two
@@ -178,6 +223,10 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 	packetBufferPool := NewNetBuffer(cfg.MTU)
 
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+
 		if !cfg.AlwaysReconnect {
 			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
 			buf := packetBufferPool.Get()
@@ -185,7 +234,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			if err != nil {
 				packetBufferPool.Put(buf)
 				log.Printf("Failed to read from TUN device while waiting for activity: %v", err)
-				time.Sleep(cfg.ReconnectDelay)
+				if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+					return
+				}
 				continue
 			}
 			packetBufferPool.Put(buf)
@@ -203,33 +254,68 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		)
 		if err != nil {
 			log.Printf("Failed to connect tunnel: %v", err)
-			time.Sleep(cfg.ReconnectDelay)
+			if ipConn != nil {
+				_ = ipConn.Close()
+			}
+			if tr != nil {
+				_ = tr.Close()
+			}
+			if udpConn != nil {
+				_ = udpConn.Close()
+			}
+			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+				return
+			}
 			continue
 		}
 		if rsp.StatusCode != 200 {
 			log.Printf("Tunnel connection failed: %s", rsp.Status)
-			ipConn.Close()
-			if udpConn != nil {
-				udpConn.Close()
-			}
+			_ = ipConn.Close()
 			if tr != nil {
-				tr.Close()
+				_ = tr.Close()
 			}
-			time.Sleep(cfg.ReconnectDelay)
+			if udpConn != nil {
+				_ = udpConn.Close()
+			}
+			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+				return
+			}
 			continue
 		}
 
 		log.Println("Connected to MASQUE server")
 
+		if cfg.OnConnect != "" {
+			env := cloneHookEnv(cfg.HookEnv)
+			env["USQUE_EVENT"] = "connect"
+			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
+			RunHook(cfg.OnConnect, env)
+		}
+
 		errChan := make(chan error, 2)
+		pumpCtx, cancelPumps := context.WithCancel(ctx)
+		var wg sync.WaitGroup
+		var readMu sync.Mutex
+
+		wg.Add(2)
 
 		go func() {
+			defer wg.Done()
 			for {
+				if pumpCtx.Err() != nil {
+					return
+				}
 				buf := packetBufferPool.Get()
+				readMu.Lock()
 				n, err := cfg.Device.ReadPacket(buf)
+				readMu.Unlock()
 				if err != nil {
 					packetBufferPool.Put(buf)
 					errChan <- fmt.Errorf("failed to read from TUN device: %w", err)
+					return
+				}
+				if pumpCtx.Err() != nil {
+					packetBufferPool.Put(buf)
 					return
 				}
 				icmp, err := ipConn.WritePacket(buf[:n])
@@ -257,6 +343,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		}()
 
 		go func() {
+			defer wg.Done()
 			buf := packetBufferPool.Get()
 			defer packetBufferPool.Put(buf)
 			for {
@@ -282,13 +369,36 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 
 		err = <-errChan
 		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
-		ipConn.Close()
-		if udpConn != nil {
-			udpConn.Close()
+
+		if cfg.OnDisconnect != "" {
+			env := cloneHookEnv(cfg.HookEnv)
+			env["USQUE_EVENT"] = "disconnect"
+			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
+			RunHook(cfg.OnDisconnect, env)
 		}
+
+		cancelPumps()
+		_ = ipConn.Close()
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(pumpShutdownGrace):
+			log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
+		}
+
 		if tr != nil {
-			tr.Close()
+			_ = tr.Close()
 		}
-		time.Sleep(cfg.ReconnectDelay)
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+			return
+		}
 	}
 }

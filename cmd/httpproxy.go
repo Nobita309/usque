@@ -175,6 +175,16 @@ var httpProxyCmd = &cobra.Command{
 			return
 		}
 
+		systemDNS, err := cmd.Flags().GetBool("system-dns")
+		if err != nil {
+			cmd.Printf("Failed to get system-dns flag: %v\n", err)
+			return
+		}
+		if systemDNS && !localDNS {
+			log.Println("Warning: --system-dns only applies with -l; ignoring")
+			systemDNS = false
+		}
+
 		mtu, err := cmd.Flags().GetInt("mtu")
 		if err != nil {
 			cmd.Printf("Failed to get MTU: %v\n", err)
@@ -205,6 +215,24 @@ var httpProxyCmd = &cobra.Command{
 			return
 		}
 
+		onConnect, err := cmd.Flags().GetString("on-connect")
+		if err != nil {
+			cmd.Printf("Failed to get on-connect flag: %v\n", err)
+			return
+		}
+
+		onDisconnect, err := cmd.Flags().GetString("on-disconnect")
+		if err != nil {
+			cmd.Printf("Failed to get on-disconnect flag: %v\n", err)
+			return
+		}
+
+		hookEnv := map[string]string{
+			"USQUE_MODE": "http-proxy",
+			"USQUE_IPV4": config.AppConfig.IPv4,
+			"USQUE_IPV6": config.AppConfig.IPv6,
+		}
+
 		var authHeader string
 		if username != "" && password != "" {
 			authHeader = "Basic " + internal.LoginToBase64(username, password)
@@ -215,9 +243,9 @@ var httpProxyCmd = &cobra.Command{
 			cmd.Printf("Failed to create virtual TUN device: %v\n", err)
 			return
 		}
-		defer tunDev.Close()
+		defer func() { _ = tunDev.Close() }()
 
-		resolver := internal.GetProxyResolver(localDNS, tunNet, dnsAddrs, dnsTimeout)
+		resolver := internal.GetProxyResolver(localDNS, systemDNS, tunNet, dnsAddrs, dnsTimeout)
 
 		go api.MaintainTunnel(context.Background(), api.MaintainTunnelConfig{
 			TLSConfig:         tlsConfig,
@@ -229,6 +257,9 @@ var httpProxyCmd = &cobra.Command{
 			ReconnectDelay:    reconnectDelay,
 			AlwaysReconnect:   alwaysReconnect,
 			UseHTTP2:          useHTTP2,
+			OnConnect:         onConnect,
+			OnDisconnect:      onDisconnect,
+			HookEnv:           hookEnv,
 		})
 
 		server := &http.Server{
@@ -305,30 +336,30 @@ func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		destConn.Close()
+		_ = destConn.Close()
 		return
 	}
 
 	clientConn, _, err := hj.Hijack()
 	if err != nil {
 		http.Error(w, "Hijacking failed", http.StatusInternalServerError)
-		destConn.Close()
+		_ = destConn.Close()
 		return
 	}
 
 	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	if err != nil {
-		clientConn.Close()
-		destConn.Close()
+		_ = clientConn.Close()
+		_ = destConn.Close()
 		return
 	}
 
 	go func() {
-		defer destConn.Close()
-		defer clientConn.Close()
-		io.Copy(destConn, clientConn)
+		defer func() { _ = destConn.Close() }()
+		defer func() { _ = clientConn.Close() }()
+		_, _ = io.Copy(destConn, clientConn)
 	}()
-	io.Copy(clientConn, destConn)
+	_, _ = io.Copy(clientConn, destConn)
 }
 
 // handleHTTPProxy forwards HTTP proxy requests to the destination and relays responses back to the client using the provided resolver.
@@ -339,11 +370,6 @@ func handleHTTPSConnect(w http.ResponseWriter, r *http.Request, tunNet *netstack
 //   - tunNet: *netstack.Net - The netstack network interface.
 //   - resolver: *net.Resolver - The DNS resolver to use for the tunnel.
 func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Net, resolver *net.Resolver) {
-	port := r.URL.Port()
-	if port == "" {
-		port = "80"
-	}
-
 	client := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -380,11 +406,11 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Ne
 		http.Error(w, "Failed to reach destination", http.StatusServiceUnavailable)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 // copyHeader copies HTTP headers from one header map to another.
@@ -406,7 +432,7 @@ func init() {
 	httpProxyCmd.Flags().StringP("username", "u", "", "Username for proxy authentication (specify both username and password to enable)")
 	httpProxyCmd.Flags().StringP("password", "w", "", "Password for proxy authentication (specify both username and password to enable)")
 	httpProxyCmd.Flags().IntP("connect-port", "P", 443, "Used port for MASQUE connection")
-	httpProxyCmd.Flags().StringArrayP("dns", "d", []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}, "DNS servers to use")
+	httpProxyCmd.Flags().StringArrayP("dns", "d", []string{"9.9.9.9", "149.112.112.112", "2620:fe::fe", "2620:fe::9"}, "DNS servers for the tunnel stack; with -l also used for proxy name lookups (unless --system-dns)")
 	httpProxyCmd.Flags().DurationP("dns-timeout", "t", 2*time.Second, "Timeout for DNS queries")
 	httpProxyCmd.Flags().BoolP("ipv6", "6", false, "Use IPv6 for MASQUE connection")
 	httpProxyCmd.Flags().BoolP("no-tunnel-ipv4", "F", false, "Disable IPv4 inside the MASQUE tunnel")
@@ -419,6 +445,9 @@ func init() {
 	httpProxyCmd.Flags().Bool("always-reconnect", false, "Always reconnect after tunnel loss, even when idle")
 	httpProxyCmd.Flags().Bool("http2", false, "Use HTTP/2 over TCP+TLS instead of HTTP/3 over QUIC."+config.EndpointHelpSuffixH2)
 	httpProxyCmd.Flags().Bool("insecure", false, "Disable endpoint certificate pinning and trust any certificate")
-	httpProxyCmd.Flags().BoolP("local-dns", "l", false, "Don't use the tunnel for DNS queries")
+	httpProxyCmd.Flags().BoolP("local-dns", "l", false, "Do not send proxy DNS through the tunnel; use -d over the host instead. Add --system-dns to use the OS resolver instead of -d")
+	httpProxyCmd.Flags().Bool("system-dns", false, "With -l, resolve names via the OS (e.g. /etc/resolv.conf) instead of -d")
+	httpProxyCmd.Flags().String("on-connect", "", "Path to an executable to run after each successful tunnel connect (no args; context via USQUE_* env vars)")
+	httpProxyCmd.Flags().String("on-disconnect", "", "Path to an executable to run after each tunnel disconnect (no args; context via USQUE_* env vars)")
 	rootCmd.AddCommand(httpProxyCmd)
 }
